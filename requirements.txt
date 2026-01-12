@@ -1,0 +1,17 @@
+# Core data science
+pandas==2.2.3
+numpy==2.2.6
+scipy==1.16.3
+scikit-learn==1.8.0
+joblib==1.5.3
+matplotlib==3.10.8
+
+# Streamlit / dashboards
+streamlit==1.52.2
+
+# Explainability
+shap==0.50.0
+
+
+
+

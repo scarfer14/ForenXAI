@@ -1,0 +1,123 @@
+############################
+# OS / Editor
+############################
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+############################
+# Python
+############################
+__pycache__/
+*.py[cod]
+*.pyd
+
+.venv/
+venv/
+env/
+ENV/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+############################
+# Jupyter / Notebooks
+############################
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+############################
+# Logs / temp
+############################
+*.log
+logs/
+tmp/
+temp/
+
+############################
+# Data (do not commit datasets/exports)
+# (NF-CSE-CIC-IDS2018 and synthetic exports can be large/licensed)
+############################
+data/
+datasets/
+dataset/
+raw_data/
+processed_data/
+*.csv
+*.parquet
+*.feather
+*.pkl
+
+############################
+# Model artifacts
+############################
+models/
+artifacts/
+checkpoints/
+*.joblib
+*.pkl
+*.onnx
+
+############################
+# Reports / outputs (plots, metrics exports)
+############################
+reports/
+outputs/
+results/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.html
+
+############################
+# Secrets / environment files
+############################
+.env
+.env.*
+*.env
+secrets.*
+**/secrets.*
+
+############################
+# Gretel (synthetic generation artifacts)
+############################
+gretel/
+gretel_artifacts/
+*.tar.gz
+
+############################
+# Streamlit
+############################
+.streamlit/secrets.toml
+
+############################
+# Node (only if you add a web frontend later)
+############################
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+############################
+# Build / dist
+############################
+build/
+dist/
+*.whl
+*.zip
