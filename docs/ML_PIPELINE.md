@@ -4,12 +4,16 @@
 **[PHASE 1] Synthetic Data Generation (synthetic_data_generation.ipynb)**
 
 - Uses NF-UNSW-NB15-v3 dataset (see DATASET_SOURCE.md) to generate a synthetic dataset via CTGAN.
+
 - Log original dataset statistics (class distributions, feature types/ranges) for comparison.
+
+- Train CTGAN on the original dataset, tuning hyperparameters to balance fidelity and diversity.
+
 ---------------------------------------------------------------------------------------------------
 **[PHASE 2] Data Preprocessing (data_prep.ipynb)**
 
 - Load the cleaned dataset (see DATASET_SOURCE.md) and log shapes/types.
-- Sanity-check nulls, duplicates, and basic distributions; visualize anomalies when found.
+- Check nulls, duplicates, and basic distributions; visualize anomalies when found.
 - Produce the deterministic 70/15/15 split (store random seed) for training, validation, and testing artifacts (training 70%, validation 15%, testing 15%).
 
 ---------------------------------------------------------------------------------------------------
