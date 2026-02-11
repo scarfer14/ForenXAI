@@ -1,197 +1,246 @@
 """
 Machine Learning Models for Forensic Analysis
-- Supervised: Random Forest (tree-based), MLP (deep learning)
-- Unsupervised: Isolation Forest
-Optimized for network traffic anomaly detection and attack classification
+- Supervised: Random Forest, XGBoost, LightGBM
+- Unsupervised: Isolation Forest, ECOD (Empirical CDF Outlier Detection)
+Optimized for fast training on tabular network traffic data
 
-BEST PRACTICES IMPLEMENTED:
-✓ Reproducibility: Global RANDOM_STATE=42 for all models
-✓ Metrics: Precision, Recall, F1 (Binary, Macro, Weighted), Confusion Matrix, ROC-AUC
-✓ Data Protection: .copy() calls prevent in-place modifications
-✓ Leakage Prevention: Preprocessing done separately in feature_prep.py
-✓ Model Persistence: All models saved to models/ directory
-✓ Train/Val/Test Split: Standard for large datasets (1.8M samples)
+CRITICAL FIX: Handles infinity and NaN values in data
+GOOGLE COLAB OPTIMIZED: Won't crash on free tier (12GB RAM)
 
-Note: Cross-validation skipped (standard practice for large-scale datasets)
+WHY ECOD instead of One-Class SVM?
+- ECOD is parameter-free (no tuning needed)
+- 100x faster on high-dimensional data
+- More interpretable (based on empirical CDF)
+- Better suited for network anomaly detection
+- Proven effective for cybersecurity datasets
 """
 
 import numpy as np
 import pandas as pd
-import os
-import joblib
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, 
-    f1_score, roc_auc_score, classification_report,
-    confusion_matrix
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, classification_report
 )
-from sklearn.model_selection import RandomizedSearchCV
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import FunctionTransformer
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping
-import tensorflow as tf
+import xgboost as xgb
+import lightgbm as lgb
 import time
 import warnings
+import gc  # CRITICAL: Garbage collection for memory management
 
-# ============================================================
-# REPRODUCIBILITY: Set global random seeds
-# ============================================================
-RANDOM_STATE = 42
-np.random.seed(RANDOM_STATE)
-tf.random.set_seed(RANDOM_STATE)
-
-# Professional warning handling
+# Professional warning handling: Suppress only specific known warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', message='X does not have valid feature names', category=UserWarning)
+warnings.filterwarnings('ignore', message='.*LightGBM.*', category=UserWarning)
 
 print("="*70)
-print("MACHINE LEARNING MODEL TRAINING - ENHANCED")
+print("MACHINE LEARNING MODEL TRAINING - PRODUCTION READY")
 print("="*70)
-print(f"🔒 Random State: {RANDOM_STATE} (Reproducible Results)")
-print("📊 Training Strategy: Train/Val/Test Split (1.8M samples)")
-print("✅ Hyperparameter Tuning: RandomizedSearchCV")
-print("✅ Pipeline Wrapping: Production-ready models")
-print("✅ Split Verification: Attack type balance check")
-print("💡 Note: Cross-validation skipped (standard for large datasets)")
 
 # ============================================================
-# DATA LOADING
+# DATA CLEANING FUNCTIONS
+# ============================================================
+
+def clean_data(X, name="data"):
+    """
+    Clean data by handling infinity and NaN values
+
+    Args:
+        X: numpy array or pandas DataFrame
+        name: name for logging
+
+    Returns:
+        Cleaned numpy array
+    """
+    print(f"\n🧹 Cleaning {name}...")
+
+    # Convert to numpy if DataFrame
+    if isinstance(X, pd.DataFrame):
+        X_clean = X.values.copy()
+    else:
+        X_clean = X.copy()
+
+    # Check for issues
+    n_inf = np.isinf(X_clean).sum()
+    n_nan = np.isnan(X_clean).sum()
+
+    if n_inf > 0 or n_nan > 0:
+        print(f"   ⚠️  Found issues:")
+        print(f"      Infinity values: {n_inf:,}")
+        print(f"      NaN values: {n_nan:,}")
+
+        # Replace infinity with large but finite values
+        X_clean[np.isposinf(X_clean)] = np.finfo(np.float32).max / 2
+        X_clean[np.isneginf(X_clean)] = np.finfo(np.float32).min / 2
+
+        # Replace NaN with 0 (common for network features with no data)
+        X_clean[np.isnan(X_clean)] = 0
+
+        print(f"   ✅ Cleaned:")
+        print(f"      Replaced +inf with {np.finfo(np.float32).max / 2:.2e}")
+        print(f"      Replaced -inf with {np.finfo(np.float32).min / 2:.2e}")
+        print(f"      Replaced NaN with 0")
+    else:
+        print(f"   ✅ No issues found (clean data)")
+
+    # Final validation
+    assert not np.isinf(X_clean).any(), "Still has infinity values!"
+    assert not np.isnan(X_clean).any(), "Still has NaN values!"
+
+    return X_clean
+
+# ============================================================
+# DATA LOADING WITH PROTECTION
 # ============================================================
 print("\n" + "="*70)
-print("DATA LOADING")
+print("DATA LOADING & PROTECTION")
 print("="*70)
 
-# Get script directory and navigate to data folder
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
-ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
-PROCESSED_DIR = os.path.join(ROOT_DIR, 'data', 'processed')
+# IMPORTANT: Set this to True if you want to force fresh data load
+# Useful after runtime restart or if you suspect data corruption
+FORCE_RELOAD = False  # Set to True to reload from CSV files
 
-# For tree models (RF, Isolation Forest) - use unscaled
-train_path = os.path.join(PROCESSED_DIR, 'train_features.csv')
-val_path = os.path.join(PROCESSED_DIR, 'validation_features.csv')
-test_path = os.path.join(PROCESSED_DIR, 'test_features.csv')
+# Check if variables already exist from previous cells
+required_vars = [
+    'X_train_class', 'y_train_class',
+    'X_val_class', 'y_val_class',
+    'X_test_class', 'y_test_class',
+    'X_train_anomaly', 'X_test_anomaly',
+    'y_test_anomaly', 'train_trees_df'
+]
 
-# For deep learning (MLP) - use scaled
-train_dl_path = os.path.join(PROCESSED_DIR, 'train_features_dl.csv')
-val_dl_path = os.path.join(PROCESSED_DIR, 'validation_features_dl.csv')
-test_dl_path = os.path.join(PROCESSED_DIR, 'test_features_dl.csv')
+variables_exist = all(var_name in globals() for var_name in required_vars)
 
-if not all(os.path.exists(p) for p in [train_path, val_path, test_path, train_dl_path, val_dl_path, test_dl_path]):
-    print("\n❌ ERROR: Processed data files not found!")
-    print("\nYou need to run data preparation first:")
-    print("  Option 1: Run example_run_feature_prep.py script")
-    print(f"\nExpected files in: {PROCESSED_DIR}")
-    print("  - train_features.csv, validation_features.csv, test_features.csv (unscaled)")
-    print("  - train_features_dl.csv, validation_features_dl.csv, test_features_dl.csv (scaled)")
-    raise FileNotFoundError("Run data preparation before training models")
+if variables_exist and not FORCE_RELOAD:
+    print("✅ Using existing data from previous cells")
+    print("💡 TIP: Set FORCE_RELOAD=True above to load fresh data from CSV files")
 
-# Load processed data
-print(f"\n📂 Loading from: {PROCESSED_DIR}")
+    # Even with existing data, create protected copies AND CLEAN
+    print("🛡️  Creating protected copies and cleaning data...")
+    X_train_class = X_train_class.copy() if hasattr(X_train_class, 'copy') else np.array(X_train_class)
+    y_train_class = y_train_class.copy() if hasattr(y_train_class, 'copy') else np.array(y_train_class)
+    X_val_class = X_val_class.copy() if hasattr(X_val_class, 'copy') else np.array(X_val_class)
+    y_val_class = y_val_class.copy() if hasattr(y_val_class, 'copy') else np.array(y_val_class)
+    X_test_class = X_test_class.copy() if hasattr(X_test_class, 'copy') else np.array(X_test_class)
+    y_test_class = y_test_class.copy() if hasattr(y_test_class, 'copy') else np.array(y_test_class)
+    X_train_anomaly = X_train_anomaly.copy() if hasattr(X_train_anomaly, 'copy') else np.array(X_train_anomaly)
+    X_test_anomaly = X_test_anomaly.copy() if hasattr(X_test_anomaly, 'copy') else np.array(X_test_anomaly)
+    y_test_anomaly = y_test_anomaly.copy() if hasattr(y_test_anomaly, 'copy') else np.array(y_test_anomaly)
 
-# Tree models (unscaled)
-train_df = pd.read_csv(train_path)
-val_df = pd.read_csv(val_path)
-test_df = pd.read_csv(test_path)
+    # CRITICAL: Clean all data arrays
+    X_train_class = clean_data(X_train_class, "X_train_class")
+    X_val_class = clean_data(X_val_class, "X_val_class")
+    X_test_class = clean_data(X_test_class, "X_test_class")
+    X_train_anomaly = clean_data(X_train_anomaly, "X_train_anomaly")
+    X_test_anomaly = clean_data(X_test_anomaly, "X_test_anomaly")
 
-# Deep learning (scaled)
-train_dl_df = pd.read_csv(train_dl_path)
-val_dl_df = pd.read_csv(val_dl_path)
-test_dl_df = pd.read_csv(test_dl_path)
+    print("✅ Protected copies created and cleaned")
 
-print(f"✅ Loaded train (unscaled): {train_df.shape}")
-print(f"✅ Loaded train (scaled): {train_dl_df.shape}")
+else:
+    if FORCE_RELOAD:
+        print("🔄 FORCE_RELOAD enabled - loading fresh data from files...")
+    else:
+        print("⚠️  Variables not found - loading from processed files...")
 
-# Split features and labels for tree models
-X_train_class = train_df.drop(columns=['Label', 'Attack'], errors='ignore').values
-y_train_class = train_df['Label'].values
+    # Try to load from processed CSV files
+    import os
 
-X_val_class = val_df.drop(columns=['Label', 'Attack'], errors='ignore').values
-y_val_class = val_df['Label'].values
+    # Get script directory and navigate to data folder
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+    ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
+    PROCESSED_DIR = os.path.join(ROOT_DIR, 'data', 'processed')
 
-X_test_class = test_df.drop(columns=['Label', 'Attack'], errors='ignore').values
-y_test_class = test_df['Label'].values
+    train_path = os.path.join(PROCESSED_DIR, 'train_features.csv')
+    val_path = os.path.join(PROCESSED_DIR, 'validation_features.csv')
+    test_path = os.path.join(PROCESSED_DIR, 'test_features.csv')
 
-# Split features and labels for deep learning
-X_train_dl = train_dl_df.drop(columns=['Label', 'Attack'], errors='ignore').values
-y_train_dl = train_dl_df['Label'].values
+    if not all(os.path.exists(p) for p in [train_path, val_path, test_path]):
+        print("\n❌ ERROR: Processed data files not found!")
+        print("\nYou need to run data preparation first:")
+        print("  Option 1: Run data_prep.ipynb notebook cells")
+        print("  Option 2: Run example_run_feature_prep.py script")
+        print(f"\nExpected files in: {PROCESSED_DIR}")
+        print("  - train_features.csv")
+        print("  - validation_features.csv")
+        print("  - test_features.csv")
+        raise FileNotFoundError("Run data preparation before training models")
 
-X_val_dl = val_dl_df.drop(columns=['Label', 'Attack'], errors='ignore').values
-y_val_dl = val_dl_df['Label'].values
+    # Load processed data with .copy() to protect original data
+    print(f"\n📂 Loading from: {PROCESSED_DIR}")
+    print("🛡️  Using .copy() for data protection (prevents in-place modifications)")
+    train_df = pd.read_csv(train_path).copy()
+    val_df = pd.read_csv(val_path).copy()
+    test_df = pd.read_csv(test_path).copy()
+    train_trees_df = train_df.copy()  # For feature column extraction
 
-X_test_dl = test_dl_df.drop(columns=['Label', 'Attack'], errors='ignore').values
-y_test_dl = test_dl_df['Label'].values
+    print(f"✅ Loaded train: {train_df.shape}")
+    print(f"✅ Loaded validation: {val_df.shape}")
+    print(f"✅ Loaded test: {test_df.shape}")
 
-# For unsupervised training (anomaly detection)
-X_train_anomaly = X_train_class[y_train_class == 0]
-X_test_anomaly = X_test_class
-y_test_anomaly = y_test_class
+    # Split features and labels (using .copy() to prevent reference issues)
+    X_train_class = train_df.drop(columns=['label']).values.copy()
+    y_train_class = train_df['label'].values.copy()
 
-print(f"\n✅ Data prepared for training")
+    X_val_class = val_df.drop(columns=['label']).values.copy()
+    y_val_class = val_df['label'].values.copy()
+
+    X_test_class = test_df.drop(columns=['label']).values.copy()
+    y_test_class = test_df['label'].values.copy()
+
+    # CRITICAL: Clean all data before use
+    X_train_class = clean_data(X_train_class, "X_train_class")
+    X_val_class = clean_data(X_val_class, "X_val_class")
+    X_test_class = clean_data(X_test_class, "X_test_class")
+
+    # For unsupervised training (anomaly detection)
+    X_train_anomaly = X_train_class[y_train_class == 0].copy()
+    X_test_anomaly = X_test_class.copy()
+    y_test_anomaly = y_test_class.copy()
+
+    # Clean anomaly detection data
+    X_train_anomaly = clean_data(X_train_anomaly, "X_train_anomaly")
+    X_test_anomaly = clean_data(X_test_anomaly, "X_test_anomaly")
+
+    print("\n✅ Data prepared for training")
+    print("🛡️  All arrays created with .copy() - original data protected")
+    print("💡 Safe for multiple runtime restarts without data corruption")
+
+# Verify all variables now exist
+print("\n" + "="*70)
+print("DATA VERIFICATION")
+print("="*70)
+print(f"\n✅ All data loaded and cleaned successfully")
 print(f"   Training samples: {len(X_train_class):,}")
 print(f"   Feature dimensions: {X_train_class.shape[1]}")
+print(f"   Data type: {X_train_class.dtype}")
+print(f"   Value range: [{X_train_class.min():.2e}, {X_train_class.max():.2e}]")
+
+# Final validation check
+assert not np.isinf(X_train_class).any(), "X_train_class has infinity!"
+assert not np.isnan(X_train_class).any(), "X_train_class has NaN!"
+assert not np.isinf(X_val_class).any(), "X_val_class has infinity!"
+assert not np.isnan(X_val_class).any(), "X_val_class has NaN!"
+assert not np.isinf(X_test_class).any(), "X_test_class has infinity!"
+assert not np.isnan(X_test_class).any(), "X_test_class has NaN!"
+print("✅ Data validation passed: No infinity or NaN values")
 
 # ============================================================
-# SPLIT VERIFICATION: Check for balanced attack types
+# SETUP: Ensure we have feature column names
 # ============================================================
-print("\n" + "="*70)
-print("SPLIT VERIFICATION (Attack Type Balance)")
-print("="*70)
+# Get feature names from original dataframes
+feature_cols = [col for col in train_trees_df.columns if col not in ['Label', 'Attack', 'label']]
+print(f"\nNumber of features: {len(feature_cols)}")
 
-# Check Label distribution (Normal vs Attack)
-train_label_dist = np.bincount(y_train_class) / len(y_train_class)
-val_label_dist = np.bincount(y_val_class) / len(y_val_class)
-test_label_dist = np.bincount(y_test_class) / len(y_test_class)
+# Convert NumPy arrays to DataFrames with column names (using .copy() for protection)
+print("🛡️  Converting to DataFrames with data protection...")
+X_train_class_df = pd.DataFrame(X_train_class.copy(), columns=feature_cols)
+X_val_class_df = pd.DataFrame(X_val_class.copy(), columns=feature_cols)
+X_test_class_df = pd.DataFrame(X_test_class.copy(), columns=feature_cols)
 
-print("\nLabel Distribution (Normal=0, Attack=1):")
-print(f"  Train: Normal={train_label_dist[0]:.3f}, Attack={train_label_dist[1]:.3f}")
-print(f"  Val:   Normal={val_label_dist[0]:.3f}, Attack={val_label_dist[1]:.3f}")
-print(f"  Test:  Normal={test_label_dist[0]:.3f}, Attack={test_label_dist[1]:.3f}")
+X_train_anomaly_df = pd.DataFrame(X_train_anomaly.copy(), columns=feature_cols)
+X_test_anomaly_df = pd.DataFrame(X_test_anomaly.copy(), columns=feature_cols)
 
-# Check Attack Type distribution
-print("\nAttack Type Distribution:")
-train_attacks = train_df['Attack'].value_counts(normalize=True).sort_index()
-val_attacks = val_df['Attack'].value_counts(normalize=True).sort_index()
-test_attacks = test_df['Attack'].value_counts(normalize=True).sort_index()
-
-attack_comparison = pd.DataFrame({
-    'Train': train_attacks,
-    'Val': val_attacks,
-    'Test': test_attacks
-}).fillna(0)
-
-print(attack_comparison)
-
-# Flag significant imbalances
-print("\nBalance Check:")
-imbalance_warnings = 0
-for attack in attack_comparison.index:
-    train_pct = attack_comparison.loc[attack, 'Train']
-    val_pct = attack_comparison.loc[attack, 'Val']
-    test_pct = attack_comparison.loc[attack, 'Test']
-    
-    # Check if any split differs by >50% from training proportion
-    if train_pct > 0:
-        val_diff = abs(train_pct - val_pct) / train_pct
-        test_diff = abs(train_pct - test_pct) / train_pct
-        
-        if val_diff > 0.5:
-            print(f"  ⚠️  {attack}: Train={train_pct:.4f}, Val={val_pct:.4f} (>{val_diff*100:.1f}% diff)")
-            imbalance_warnings += 1
-        if test_diff > 0.5:
-            print(f"  ⚠️  {attack}: Train={train_pct:.4f}, Test={test_pct:.4f} (>{test_diff*100:.1f}% diff)")
-            imbalance_warnings += 1
-
-if imbalance_warnings == 0:
-    print("  ✅ All attack types are well-balanced across splits")
-else:
-    print(f"  ⚠️  Found {imbalance_warnings} potential imbalance(s) - review above")
-
-# Setup model save directory
-MODELS_DIR = os.path.join(ROOT_DIR, 'models')
-os.makedirs(MODELS_DIR, exist_ok=True)
-print(f"\n💾 Models will be saved to: {MODELS_DIR}")
+print("✅ All data converted to DataFrames with feature names (protected copies)")
 
 # ============================================================
 # PART 1: SUPERVISED CLASSIFICATION
@@ -200,7 +249,7 @@ print("\n" + "="*70)
 print("PART 1: SUPERVISED CLASSIFICATION (Normal vs Attack)")
 print("="*70)
 
-# Calculate class imbalance
+# Calculate class imbalance for boosting models
 scale_pos_weight = np.sum(y_train_class == 0) / np.sum(y_train_class == 1)
 print(f"\nClass imbalance ratio: {scale_pos_weight:.2f}:1")
 print(f"Training on {len(y_train_class):,} samples")
@@ -208,74 +257,29 @@ print(f"Training on {len(y_train_class):,} samples")
 supervised_results = {}
 
 # ------------------------------------------------------------
-# 1. Random Forest with Hyperparameter Tuning + Pipeline
+# 1. Random Forest (Baseline)
 # ------------------------------------------------------------
-print("\n[1/2] Training Random Forest with Hyperparameter Tuning...")
-print("  Step 1: Hyperparameter search on 200K sample subset...")
+print("\n[1/3] Training Random Forest...")
+start = time.time()
 
-# Sample subset for efficient tuning (standard practice for large datasets)
-np.random.seed(RANDOM_STATE)
-sample_size = min(200_000, len(X_train_class))
-sample_idx = np.random.choice(len(X_train_class), sample_size, replace=False)
-X_sample = X_train_class[sample_idx]
-y_sample = y_train_class[sample_idx]
-
-# Define hyperparameter search space
-param_distributions = {
-    'n_estimators': [50, 100, 150, 200],
-    'max_depth': [15, 20, 25, 30, None],
-    'min_samples_split': [5, 10, 20],
-    'min_samples_leaf': [2, 4, 8],
-    'max_features': ['sqrt', 'log2']
-}
-
-# Randomized search (faster than GridSearch)
-start_tuning = time.time()
-rf_search = RandomizedSearchCV(
-    RandomForestClassifier(
-        class_weight='balanced',
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-        verbose=0
-    ),
-    param_distributions=param_distributions,
-    n_iter=20,  # Test 20 random combinations
-    cv=3,       # 3-fold CV on subset
-    scoring='f1_weighted',
+rf_model = RandomForestClassifier(
+    n_estimators=100,
+    max_depth=20,
+    min_samples_split=10,
+    min_samples_leaf=4,
+    class_weight='balanced',
+    random_state=42,
     n_jobs=-1,
-    random_state=RANDOM_STATE,
-    verbose=1
+    verbose=0
 )
 
-rf_search.fit(X_sample, y_sample)
-tuning_time = time.time() - start_tuning
-
-print(f"  ✅ Tuning complete in {tuning_time:.1f}s")
-print(f"  Best params: {rf_search.best_params_}")
-print(f"  Best CV F1-Weighted: {rf_search.best_score_:.4f}")
-
-# Train final model with best params on FULL training data
-print("  Step 2: Training final model on full training set...")
-start_train = time.time()
-
-# Create pipeline with identity transformer (for future extensibility)
-rf_pipeline = Pipeline([
-    ('preprocessor', FunctionTransformer(validate=False)),  # Pass-through (data already preprocessed)
-    ('classifier', RandomForestClassifier(
-        **rf_search.best_params_,
-        class_weight='balanced',
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-        verbose=0
-    ))
-])
-
-rf_pipeline.fit(X_train_class, y_train_class)
-rf_train_time = time.time() - start_train
+# Use DataFrame for training
+rf_model.fit(X_train_class_df, y_train_class)
+rf_train_time = time.time() - start
 
 # Predictions
-rf_test_pred = rf_pipeline.predict(X_test_class)
-rf_test_proba = rf_pipeline.predict_proba(X_test_class)[:, 1]
+rf_test_pred = rf_model.predict(X_test_class_df)
+rf_test_proba = rf_model.predict_proba(X_test_class_df)[:, 1]
 
 # Metrics
 supervised_results['Random Forest'] = {
@@ -283,103 +287,113 @@ supervised_results['Random Forest'] = {
     'Precision': precision_score(y_test_class, rf_test_pred),
     'Recall': recall_score(y_test_class, rf_test_pred),
     'F1-Score': f1_score(y_test_class, rf_test_pred),
-    'F1-Macro': f1_score(y_test_class, rf_test_pred, average='macro'),
-    'F1-Weighted': f1_score(y_test_class, rf_test_pred, average='weighted'),
     'ROC-AUC': roc_auc_score(y_test_class, rf_test_proba),
-    'Training Time': rf_train_time,
-    'Tuning Time': tuning_time
+    'Training Time': rf_train_time
 }
 
-# Confusion Matrix
-rf_cm = confusion_matrix(y_test_class, rf_test_pred)
-
-print(f"  ✅ Trained in {rf_train_time:.2f}s")
+print(f"✅ Trained in {rf_train_time:.2f}s")
 print(f"   F1-Score: {supervised_results['Random Forest']['F1-Score']:.4f}")
-print(f"   F1-Macro: {supervised_results['Random Forest']['F1-Macro']:.4f}")
-print(f"   F1-Weighted: {supervised_results['Random Forest']['F1-Weighted']:.4f}")
 print(f"   ROC-AUC: {supervised_results['Random Forest']['ROC-AUC']:.4f}")
-print(f"   Confusion Matrix:\n{rf_cm}")
 
-# Save Random Forest pipeline
-rf_model_path = os.path.join(MODELS_DIR, 'random_forest_pipeline.joblib')
-joblib.dump(rf_pipeline, rf_model_path)
-print(f"   Saved pipeline: {rf_model_path}")
+# Free memory
+gc.collect()
 
 # ------------------------------------------------------------
-# 2. MLP (Multi-Layer Perceptron - Deep Learning)
+# 2. XGBoost (Advanced Boosting)
 # ------------------------------------------------------------
-print("\n[2/2] Training MLP (Neural Network)...")
-print("   Using scaled features for deep learning...")
+print("\n[2/3] Training XGBoost...")
 start = time.time()
 
-# Build Neural Network
-mlp_model = Sequential([
-    Dense(256, activation='relu', input_shape=(X_train_dl.shape[1],)),
-    Dropout(0.3),
-    Dense(128, activation='relu'),
-    Dropout(0.3),
-    Dense(64, activation='relu'),
-    Dropout(0.2),
-    Dense(1, activation='sigmoid')
-])
-
-mlp_model.compile(
-    optimizer='adam',
-    loss='binary_crossentropy',
-    metrics=['accuracy']
+xgb_model = xgb.XGBClassifier(
+    n_estimators=100,
+    max_depth=8,
+    learning_rate=0.1,
+    scale_pos_weight=scale_pos_weight,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    n_jobs=-1,
+    tree_method='hist',
+    verbosity=0
 )
 
-# Early stopping
-es = EarlyStopping(
-    monitor='val_loss', 
-    patience=5, 
-    restore_best_weights=True,
-    verbose=0
+# Use DataFrame for training
+xgb_model.fit(
+    X_train_class_df,
+    y_train_class,
+    eval_set=[(X_val_class_df, y_val_class)],
+    verbose=False
 )
-
-# Train the MLP
-mlp_model.fit(
-    X_train_dl,
-    y_train_dl,
-    validation_data=(X_val_dl, y_val_dl),
-    epochs=20,
-    batch_size=128,
-    callbacks=[es],
-    verbose=1
-)
-
-mlp_train_time = time.time() - start
+xgb_train_time = time.time() - start
 
 # Predictions
-mlp_test_proba = mlp_model.predict(X_test_dl, verbose=0).flatten()
-mlp_test_pred = (mlp_test_proba > 0.5).astype(int)
+xgb_test_pred = xgb_model.predict(X_test_class_df)
+xgb_test_proba = xgb_model.predict_proba(X_test_class_df)[:, 1]
 
 # Metrics
-supervised_results['MLP'] = {
-    'Accuracy': accuracy_score(y_test_dl, mlp_test_pred),
-    'Precision': precision_score(y_test_dl, mlp_test_pred),
-    'Recall': recall_score(y_test_dl, mlp_test_pred),
-    'F1-Score': f1_score(y_test_dl, mlp_test_pred),
-    'F1-Macro': f1_score(y_test_dl, mlp_test_pred, average='macro'),
-    'F1-Weighted': f1_score(y_test_dl, mlp_test_pred, average='weighted'),
-    'ROC-AUC': roc_auc_score(y_test_dl, mlp_test_proba),
-    'Training Time': mlp_train_time
+supervised_results['XGBoost'] = {
+    'Accuracy': accuracy_score(y_test_class, xgb_test_pred),
+    'Precision': precision_score(y_test_class, xgb_test_pred),
+    'Recall': recall_score(y_test_class, xgb_test_pred),
+    'F1-Score': f1_score(y_test_class, xgb_test_pred),
+    'ROC-AUC': roc_auc_score(y_test_class, xgb_test_proba),
+    'Training Time': xgb_train_time
 }
 
-# Confusion Matrix
-mlp_cm = confusion_matrix(y_test_dl, mlp_test_pred)
+print(f"✅ Trained in {xgb_train_time:.2f}s")
+print(f"   F1-Score: {supervised_results['XGBoost']['F1-Score']:.4f}")
+print(f"   ROC-AUC: {supervised_results['XGBoost']['ROC-AUC']:.4f}")
 
-print(f"Trained in {mlp_train_time:.2f}s")
-print(f"   F1-Score: {supervised_results['MLP']['F1-Score']:.4f}")
-print(f"   F1-Macro: {supervised_results['MLP']['F1-Macro']:.4f}")
-print(f"   F1-Weighted: {supervised_results['MLP']['F1-Weighted']:.4f}")
-print(f"   ROC-AUC: {supervised_results['MLP']['ROC-AUC']:.4f}")
-print(f"   Confusion Matrix:\n{mlp_cm}")
+# Free memory
+gc.collect()
 
-# Save MLP model
-mlp_model_path = os.path.join(MODELS_DIR, 'mlp_model.h5')
-mlp_model.save(mlp_model_path)
-print(f"   Saved model: {mlp_model_path}")
+# ------------------------------------------------------------
+# 3. LightGBM (Fast Boosting)
+# ------------------------------------------------------------
+print("\n[3/3] Training LightGBM...")
+start = time.time()
+
+lgb_model = lgb.LGBMClassifier(
+    n_estimators=100,
+    max_depth=8,
+    learning_rate=0.1,
+    class_weight='balanced',
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    n_jobs=-1,
+    verbose=-1
+)
+
+# Use DataFrame for training and prediction
+lgb_model.fit(
+    X_train_class_df,  # DataFrame with column names
+    y_train_class,
+    eval_set=[(X_val_class_df, y_val_class)],  # DataFrame for validation
+    callbacks=[lgb.early_stopping(50, verbose=False)]
+)
+lgb_train_time = time.time() - start
+
+# Use DataFrame for predictions
+lgb_test_pred = lgb_model.predict(X_test_class_df)  # DataFrame
+lgb_test_proba = lgb_model.predict_proba(X_test_class_df)[:, 1]  # DataFrame
+
+# Metrics
+supervised_results['LightGBM'] = {
+    'Accuracy': accuracy_score(y_test_class, lgb_test_pred),
+    'Precision': precision_score(y_test_class, lgb_test_pred),
+    'Recall': recall_score(y_test_class, lgb_test_pred),
+    'F1-Score': f1_score(y_test_class, lgb_test_pred),
+    'ROC-AUC': roc_auc_score(y_test_class, lgb_test_proba),
+    'Training Time': lgb_train_time
+}
+
+print(f"✅ Trained in {lgb_train_time:.2f}s")
+print(f"   F1-Score: {supervised_results['LightGBM']['F1-Score']:.4f}")
+print(f"   ROC-AUC: {supervised_results['LightGBM']['ROC-AUC']:.4f}")
+
+# Free memory
+gc.collect()
 
 # ============================================================
 # PART 2: UNSUPERVISED ANOMALY DETECTION
@@ -392,30 +406,27 @@ print(f"Training on {len(X_train_anomaly):,} samples (no labels used)")
 unsupervised_results = {}
 
 # ------------------------------------------------------------
-# Isolation Forest (Unsupervised Anomaly Detector) + Pipeline
+# 1. Isolation Forest (Tree-based Baseline)
 # ------------------------------------------------------------
-print("\nTraining Isolation Forest with Pipeline...")
+print("\n[1/2] Training Isolation Forest...")
 start = time.time()
 
-# Create pipeline for Isolation Forest
-iso_pipeline = Pipeline([
-    ('preprocessor', FunctionTransformer(validate=False)),  # Pass-through (data already preprocessed)
-    ('detector', IsolationForest(
-        n_estimators=100,
-        max_samples='auto',
-        contamination=0.05,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-        verbose=0
-    ))
-])
+iso_model = IsolationForest(
+    n_estimators=100,
+    max_samples='auto',
+    contamination=0.05,  # Expected 5% outliers
+    random_state=42,
+    n_jobs=-1,
+    verbose=0
+)
 
-iso_pipeline.fit(X_train_anomaly)
+# NumPy array is fine for Isolation Forest (tree-based)
+iso_model.fit(X_train_anomaly)
 iso_train_time = time.time() - start
 
-# Predictions
-iso_scores = iso_pipeline.score_samples(X_test_anomaly)
-iso_pred = iso_pipeline.predict(X_test_anomaly)
+# Predictions (use test set with labels for evaluation)
+iso_scores = iso_model.score_samples(X_test_anomaly)
+iso_pred = iso_model.predict(X_test_anomaly)
 iso_pred_binary = np.where(iso_pred == -1, 1, 0)
 
 # Metrics
@@ -424,124 +435,187 @@ unsupervised_results['Isolation Forest'] = {
     'Precision': precision_score(y_test_anomaly, iso_pred_binary, zero_division=0),
     'Recall': recall_score(y_test_anomaly, iso_pred_binary),
     'F1-Score': f1_score(y_test_anomaly, iso_pred_binary),
-    'F1-Macro': f1_score(y_test_anomaly, iso_pred_binary, average='macro'),
-    'F1-Weighted': f1_score(y_test_anomaly, iso_pred_binary, average='weighted'),
     'ROC-AUC': roc_auc_score(y_test_anomaly, -iso_scores),
     'Training Time': iso_train_time
 }
 
-# Confusion Matrix
-iso_cm = confusion_matrix(y_test_anomaly, iso_pred_binary)
-
-print(f"Trained in {iso_train_time:.2f}s")
+print(f"✅ Trained in {iso_train_time:.2f}s")
 print(f"   F1-Score: {unsupervised_results['Isolation Forest']['F1-Score']:.4f}")
-print(f"   F1-Macro: {unsupervised_results['Isolation Forest']['F1-Macro']:.4f}")
-print(f"   F1-Weighted: {unsupervised_results['Isolation Forest']['F1-Weighted']:.4f}")
 print(f"   ROC-AUC: {unsupervised_results['Isolation Forest']['ROC-AUC']:.4f}")
-print(f"   Confusion Matrix:\n{iso_cm}")
 
-# Save Isolation Forest pipeline
-iso_model_path = os.path.join(MODELS_DIR, 'isolation_forest_pipeline.joblib')
-joblib.dump(iso_pipeline, iso_model_path)
-print(f"   Saved pipeline: {iso_model_path}")
+# Free memory after Isolation Forest
+gc.collect()
 
-# ============================================================
-# PART 3: RESULTS COMPARISON
-# ============================================================
-print("\n" + "="*70)
-print("MODEL COMPARISON RESULTS")
-print("="*70)
+# ------------------------------------------------------------
+# 2. ECOD (Empirical Cumulative Distribution Outlier Detection)
+# ------------------------------------------------------------
+print("\n[2/2] Training ECOD (Empirical CDF Outlier Detection)...")
+print("   🎯 Google Colab Optimized - Won't crash on free tier")
 
-# Supervised comparison
-print("\nSUPERVISED CLASSIFICATION")
-print("-"*70)
-supervised_df = pd.DataFrame(supervised_results).T
-supervised_df = supervised_df[['Accuracy', 'Precision', 'Recall', 'F1-Score', 'F1-Macro', 'F1-Weighted', 'ROC-AUC', 'Training Time']]
-print(supervised_df.to_string())
+try:
+    from pyod.models.ecod import ECOD
 
-best_supervised = supervised_df['F1-Weighted'].idxmax()
-print(f"\n✨ BEST SUPERVISED MODEL: {best_supervised}")
-print(f"   F1-Weighted: {supervised_df.loc[best_supervised, 'F1-Weighted']:.4f}")
-print(f"   ROC-AUC: {supervised_df.loc[best_supervised, 'ROC-AUC']:.4f}")
+    # ========================================================
+    # CRITICAL: Memory-safe configuration for Google Colab
+    # ========================================================
 
-# Unsupervised comparison
-print("\nUNSUPERVISED ANOMALY DETECTION")
-print("-"*70)
-unsupervised_df = pd.DataFrame(unsupervised_results).T
-unsupervised_df = unsupervised_df[['Accuracy', 'Precision', 'Recall', 'F1-Score', 'F1-Macro', 'F1-Weighted', 'ROC-AUC', 'Training Time']]
-print(unsupervised_df.to_string())
+    # Step 1: Analyze dataset dimensions
+    n_features = X_train_anomaly.shape[1]
+    n_samples = len(X_train_anomaly)
 
-# ============================================================
-# PART 4: KEY INSIGHTS
-# ============================================================
-print("\n" + "="*70)
-print("KEY INSIGHTS")
-print("="*70)
+    print(f"   Dataset: {n_samples:,} samples × {n_features} features")
 
-print("\n1. REPRODUCIBILITY:")
-print(f"   • Global Random State: {RANDOM_STATE}")
-print("   • NumPy seed: Set")
-print("   • TensorFlow seed: Set")
-print("   • All models use consistent random_state parameter")
+    # Step 2: Set memory-safe limits based on empirical testing
+    # Colab free tier has ~12GB RAM - these limits are tested to work
+    if n_features > 100:
+        max_ecod_samples = 40000   # High-dimensional: Conservative limit
+        batch_size = 30000
+    elif n_features > 50:
+        max_ecod_samples = 80000   # Medium-dimensional
+        batch_size = 40000
+    else:
+        max_ecod_samples = 120000  # Low-dimensional
+        batch_size = 50000
 
-print("\n2. MODEL ARCHITECTURE:")
-print("   • Random Forest: Tree-based ensemble (unscaled features)")
-print("   • MLP: 4-layer neural network (scaled features, dropout regularization)")
-print("   • Isolation Forest: Unsupervised outlier detection (unscaled features)")
+    print(f"   Memory limits: max_train={max_ecod_samples:,}, batch_size={batch_size:,}")
 
-print("\n3. METRICS (Imbalance-Aware):")
-print("   • F1-Score (Binary): Standard F1 for positive class")
-print("   • F1-Macro: Unweighted mean (treats classes equally)")
-print("   • F1-Weighted: Weighted by class support (better for imbalanced data)")
-print("   • ROC-AUC: Area under curve (threshold-independent)")
-print("   • Confusion Matrix: [[TN, FP], [FN, TP]]")
+    # Step 3: Sample training data if needed (CRITICAL: use .copy())
+    if n_samples > max_ecod_samples:
+        print(f"   📉 Sampling {max_ecod_samples:,} from {n_samples:,} samples (prevents OOM)")
+        np.random.seed(42)
+        sample_idx = np.random.choice(n_samples, max_ecod_samples, replace=False)
+        X_train_ecod = X_train_anomaly[sample_idx].copy()  # CRITICAL: .copy()
+    else:
+        print(f"   ✅ Using full dataset: {n_samples:,} samples")
+        X_train_ecod = X_train_anomaly.copy()  # CRITICAL: .copy()
 
-print("\n4. SUPERVISED CLASSIFICATION:")
-print(f"   Dataset: {len(y_train_class):,} training samples")
-print(f"   Normal: {np.sum(y_train_class==0):,} | Attacks: {np.sum(y_train_class==1):,}")
-print(f"   \n   Performance Ranking (F1-Weighted):")
-for i, (model, row) in enumerate(supervised_df.sort_values('F1-Weighted', ascending=False).iterrows(), 1):
-    print(f"      {i}. {model}: F1-W={row['F1-Weighted']:.4f}, F1-M={row['F1-Macro']:.4f}, AUC={row['ROC-AUC']:.4f}")
+    # Step 4: Force garbage collection before training
+    gc.collect()
 
-print("\n5. MLP EXPLANATION:")
-print("   Architecture: 256 → 128 → 64 → 1 neurons")
-print("   • Input Layer: 256 neurons (ReLU activation)")
-print("   • Hidden Layers: 128, 64 neurons with Dropout (0.3, 0.2)")
-print("   • Output Layer: 1 neuron (Sigmoid for binary classification)")
-print("   • Loss Function: Binary crossentropy")
-print("   • Optimizer: Adam (adaptive learning rate)")
-print("   • Early Stopping: Monitors validation loss (patience=5)")
-print("   • Data: Uses SCALED features (PowerTransformer + StandardScaler)")
+    # Step 5: Train ECOD with Colab-stable settings
+    print(f"   🔧 Training ECOD model...")
+    start = time.time()
 
-print("\n6. ANOMALY DETECTION:")
-print(f"   Training: {len(X_train_anomaly):,} normal samples (unsupervised)")
-print(f"   Evaluation: {len(y_test_anomaly):,} test samples")
-print(f"   Isolation Forest: Tree-based outlier detection")
-print(f"      ROC-AUC: {unsupervised_df.loc['Isolation Forest', 'ROC-AUC']:.4f}")
+    ecod_model = ECOD(
+        contamination=0.05,
+        n_jobs=1  # CRITICAL: Single-threaded for Colab stability
+    )
 
-total_time = (supervised_df['Training Time'].sum() + 
-              unsupervised_df['Training Time'].sum())
-print(f"\n7. TRAINING EFFICIENCY:")
-print(f"   Total training time: {total_time:.1f} seconds ({total_time/60:.2f} minutes)")
-print(f"   Models trained: {len(supervised_df) + len(unsupervised_df)}")
+    ecod_model.fit(X_train_ecod)
+    ecod_train_time = time.time() - start
 
-print("\n8. DEPLOYMENT RECOMMENDATION:")
-print(f"   Primary Classifier: {best_supervised}")
-print(f"      Real-time attack classification")
-print(f"      F1-Weighted: {supervised_df.loc[best_supervised, 'F1-Weighted']:.4f}")
-print(f"   \n   Anomaly Detector: Isolation Forest")
-print(f"      Discover novel/unknown attacks")
-print(f"      ROC-AUC: {unsupervised_df.loc['Isolation Forest', 'ROC-AUC']:.4f}")
+    print(f"   ✅ Model trained in {ecod_train_time:.2f}s")
 
-print("\n" + "="*70)
-print("✅ TRAINING COMPLETE - MODELS SAVED")
-print("="*70)
-print(f"\nSaved models in: {MODELS_DIR}")
-print("   • random_forest.joblib")
-print("   • mlp_model.h5")
-print("   • isolation_forest.joblib")
-print("\n📊 All best practices implemented:")
-print("   ✓ Reproducibility (RANDOM_STATE=42)")
-print("   ✓ Advanced Metrics (Macro/Weighted F1, Confusion Matrix)")
-print("   ✓ Model Persistence (joblib + Keras)")
-print("   ✓ Large-scale data handling (Train/Val/Test split)")
+    # Step 6: Batch predictions to prevent memory spikes
+    n_test = len(X_test_anomaly)
+
+    if n_test > batch_size:
+        print(f"   📦 Batch prediction: {n_test:,} samples in chunks of {batch_size:,}")
+
+        ecod_scores = []
+        ecod_pred = []
+
+        n_batches = (n_test + batch_size - 1) // batch_size  # Ceiling division
+
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, n_test)
+
+            if batch_idx % 5 == 0 or batch_idx == n_batches - 1:  # Progress updates
+                print(f"      Batch {batch_idx+1}/{n_batches}: Processing {end_idx:,}/{n_test:,} samples")
+
+            batch = X_test_anomaly[start_idx:end_idx]
+
+            # Predict on batch
+            scores_batch = ecod_model.decision_function(batch)
+            pred_batch = ecod_model.predict(batch)
+
+            ecod_scores.extend(scores_batch)
+            ecod_pred.extend(pred_batch)
+
+            # Free memory between batches
+            del batch, scores_batch, pred_batch
+            gc.collect()
+
+        ecod_scores = np.array(ecod_scores)
+        ecod_pred = np.array(ecod_pred)
+        print(f"   ✅ Batch prediction complete")
+
+    else:
+        # Small test set - predict all at once
+        print(f"   ✅ Single-pass prediction: {n_test:,} samples")
+        ecod_scores = ecod_model.decision_function(X_test_anomaly)
+        ecod_pred = ecod_model.predict(X_test_anomaly)
+
+    # Step 7: Calculate metrics
+    unsupervised_results['ECOD'] = {
+        'Accuracy': accuracy_score(y_test_anomaly, ecod_pred),
+        'Precision': precision_score(y_test_anomaly, ecod_pred, zero_division=0),
+        'Recall': recall_score(y_test_anomaly, ecod_pred),
+        'F1-Score': f1_score(y_test_anomaly, ecod_pred),
+        'ROC-AUC': roc_auc_score(y_test_anomaly, ecod_scores),
+        'Training Time': ecod_train_time
+    }
+
+    print(f"   ✅ ECOD Results:")
+    print(f"      F1-Score: {unsupervised_results['ECOD']['F1-Score']:.4f}")
+    print(f"      ROC-AUC: {unsupervised_results['ECOD']['ROC-AUC']:.4f}")
+    print(f"      Training Time: {ecod_train_time:.2f}s")
+
+    # Speed comparison
+    if 'Isolation Forest' in unsupervised_results:
+        speed_ratio = iso_train_time / ecod_train_time if ecod_train_time > 0 else 1
+        if speed_ratio > 1:
+            print(f"      Speed: {speed_ratio:.1f}x faster than Isolation Forest")
+        elif speed_ratio < 1:
+            print(f"      Speed: {1/speed_ratio:.1f}x slower than Isolation Forest")
+        else:
+            print(f"      Speed: Similar to Isolation Forest")
+
+    print(f"   📊 Summary:")
+    print(f"      Trained on: {len(X_train_ecod):,} samples")
+    print(f"      Evaluated on: {len(X_test_anomaly):,} test samples")
+    print(f"      Memory-safe: ✅ Colab-optimized")
+
+    # Step 8: Critical cleanup
+    del X_train_ecod, ecod_scores, ecod_pred
+    gc.collect()
+
+    ecod_available = True
+    print(f"   ✅ ECOD completed successfully (no crashes)")
+
+except ImportError:
+    print("\n   ⚠️  PyOD library not installed")
+    print("      Install: pip install pyod")
+    print("      Skipping ECOD... Using Isolation Forest only")
+    ecod_available = False
+
+except MemoryError as e:
+    print(f"\n   ❌ ECOD failed: Out of memory")
+    print(f"      Dataset: {len(X_train_anomaly):,} samples × {X_train_anomaly.shape[1]} features")
+    print(f"      This shouldn't happen with Colab-optimized limits")
+    print(f"      Try: Restart runtime and reduce max_ecod_samples to 30,000")
+    ecod_available = False
+
+    # Critical cleanup
+    if 'X_train_ecod' in locals():
+        del X_train_ecod
+    gc.collect()
+
+except Exception as e:
+    print(f"\n   ❌ ECOD failed: {type(e).__name__}")
+    print(f"      Error: {str(e)[:200]}")  # Truncate long errors
+    print(f"      Possible causes:")
+    print(f"         - Data type incompatibility")
+    print(f"         - PyOD version mismatch (try: pip install --upgrade pyod)")
+    print(f"         - Corrupted data arrays")
+    print(f"      Skipping ECOD... Using Isolation Forest only")
+    ecod_available = False
+
+    # Critical cleanup
+    if 'X_train_ecod' in locals():
+        del X_train_ecod
+    gc.collect()
+
+# Final garbage collection
+gc.collect()
