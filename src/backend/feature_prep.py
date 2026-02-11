@@ -11,14 +11,26 @@ import seaborn as sns
 # ===============================
 # Paths
 # ===============================
-BASE_DIR = "src/backend/feature_engineering"
+# Get the absolute path to ensure paths work regardless of cwd
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.join(SCRIPT_DIR, "feature_engineering")
 ENCODER_DIR = os.path.join(BASE_DIR, "encoders")
 SCALER_DIR = os.path.join(BASE_DIR, "scalers")
-PROCESSED_DIR = "data/processed"
+
+# For processed data, use project root
+ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..'))
+PROCESSED_DIR = os.path.abspath(os.path.join(ROOT_DIR, "data", "processed"))
 
 os.makedirs(ENCODER_DIR, exist_ok=True)
 os.makedirs(SCALER_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
+
+# Debug: Show where files will be saved
+print(f"[feature_prep.py] Directories created:")
+print(f"  Encoders: {ENCODER_DIR}")
+print(f"  Scalers: {SCALER_DIR}")
+print(f"  Processed: {PROCESSED_DIR}")
+print()
 
 # ===============================
 # Helper Functions
@@ -61,6 +73,10 @@ def _encode_categorical_transform(df: pd.DataFrame, cat_cols: list, encoders: Di
 
 def _fit_scalers(df: pd.DataFrame, num_cols: list) -> Tuple[PowerTransformer, StandardScaler]:
     """Fit and apply power transformer and scaler."""
+    # Handle inf and NaN values before scaling
+    df[num_cols] = df[num_cols].replace([np.inf, -np.inf], np.nan)
+    df[num_cols] = df[num_cols].fillna(0)
+    
     power_transformer = PowerTransformer(method='yeo-johnson', standardize=False)
     df[num_cols] = power_transformer.fit_transform(df[num_cols])
     
@@ -75,6 +91,10 @@ def _fit_scalers(df: pd.DataFrame, num_cols: list) -> Tuple[PowerTransformer, St
 def _apply_scalers(df: pd.DataFrame, num_cols: list, 
                    power_transformer: PowerTransformer, scaler: StandardScaler) -> None:
     """Apply fitted scalers to data."""
+    # Handle inf and NaN values before scaling
+    df[num_cols] = df[num_cols].replace([np.inf, -np.inf], np.nan)
+    df[num_cols] = df[num_cols].fillna(0)
+    
     df[num_cols] = power_transformer.transform(df[num_cols])  # type: ignore[union-attr]
     df[num_cols] = scaler.transform(df[num_cols])  # type: ignore[union-attr]
 
@@ -97,12 +117,16 @@ def prepare_features(
         }
     """
     # 1. Combine datasets
+    print("   Combining datasets...")
     df = _combine_datasets(df_real, df_synthetic)
+    print(f"   ✅ Combined: {df.shape}")
     
     # 2. Feature Engineering
+    print("⏳ Step 2/5: Engineering features...")
     df = _engineer_features(df)
     
     # 3. Encode Categorical Variables
+    print("⏳ Step 3/5: Encoding categorical variables...")
     cat_cols = df.select_dtypes(include='object').columns.tolist()
     if fit:
         encoders = _encode_categorical_fit(df, cat_cols)
@@ -115,6 +139,7 @@ def prepare_features(
     df_trees = df.copy()  # Unscaled for RF / Isolation Forest
     
     # 5. Transform + Scale (Deep Learning only)
+    print("⏳ Step 4/5: Power transformation (this takes time)...")
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
     if fit:
         power_transformer, scaler = _fit_scalers(df, num_cols)
@@ -124,6 +149,7 @@ def prepare_features(
         _apply_scalers(df, num_cols, power_transformer, scaler)
     
     # 6. Save processed training data
+    print("⏳ Step 5/5: Saving processed data...")
     if fit:
         df_trees.to_csv(os.path.join(PROCESSED_DIR, "train_features_trees.csv"), index=False)
         df.to_csv(os.path.join(PROCESSED_DIR, "train_features_dl.csv"), index=False)
